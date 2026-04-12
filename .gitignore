@@ -1,0 +1,9 @@
+.venv/
+__pycache__/
+.pytest_cache/
+.coverage
+*.egg-info/
+build/
+dist/
+.ipynb_checkpoints/
+.vscode/

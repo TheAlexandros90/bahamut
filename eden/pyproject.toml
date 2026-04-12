@@ -1,0 +1,41 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "eden-temporal"
+version = "0.1.0"
+description = "Forecasting temporal compatible con Bahamut y con tabla interactiva para notebook."
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "numpy>=1.26",
+    "pandas>=2.0",
+]
+
+[project.optional-dependencies]
+notebook = [
+    "ipython>=8.0",
+    "ipywidgets>=8.0",
+    "openpyxl>=3.1",
+    "scikit-learn>=1.5",
+]
+prophet = [
+    "prophet>=1.1.6",
+    "cmdstanpy>=1.2.5",
+]
+dev = [
+    "pytest>=8.0",
+    "scikit-learn>=1.5",
+]
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
+addopts = "-q"
