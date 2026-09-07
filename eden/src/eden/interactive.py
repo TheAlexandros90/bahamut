@@ -9,6 +9,14 @@ from typing import Any, Mapping, Sequence
 
 import pandas as pd
 
+from ._notebook import (
+    clear_output,
+    display,
+    get_ipython,
+    publish_notebook_bindings as _eden_publish_notebook_bindings,
+    require_widgets,
+    widgets,
+)
 from .core import (
     Eden,
     EdenBahamutBundle,
@@ -19,20 +27,9 @@ from .core import (
     QuantileEnsembleAdapter,
 )
 
-try:
-    import ipywidgets as widgets
-    from IPython import get_ipython
-    from IPython.display import clear_output, display
-except Exception:
-    widgets = None
-    clear_output = None
-    display = None
-    get_ipython = None
-
 
 def _eden_require_widgets() -> None:
-    if widgets is None or clear_output is None or display is None:
-        raise ImportError("ipywidgets e IPython son necesarios para usar la tabla interactiva de Eden.")
+    require_widgets("eden-temporal")
 
 
 def _eden_resolve_namespace(namespace: Mapping[str, Any] | None = None) -> dict[str, Any]:
@@ -46,17 +43,6 @@ def _eden_resolve_namespace(namespace: Mapping[str, Any] | None = None) -> dict[
     if shell is None or not hasattr(shell, "user_ns"):
         return {}
     return dict(shell.user_ns)
-
-
-def _eden_publish_notebook_bindings(**values: Any) -> None:
-    if get_ipython is None:
-        return
-
-    shell = get_ipython()
-    if shell is None or not hasattr(shell, "user_ns"):
-        return
-
-    shell.user_ns.update(values)
 
 
 def _eden_is_bahamut_segments(value: Any) -> bool:
