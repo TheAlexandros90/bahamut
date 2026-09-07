@@ -596,10 +596,29 @@ class QuantileEnsembleAdapter(ForecastAdapter):
             )
 
         intervals: dict[str, tuple[np.ndarray, np.ndarray]] = {}
+        degenerate: list[str] = []
         for target in target_names:
             lower_raw = np.asarray(self.models_[target]["lower"].predict(x), dtype=float)
             upper_raw = np.asarray(self.models_[target]["upper"].predict(x), dtype=float)
+            if lower_raw.size and np.allclose(lower_raw, upper_raw):
+                degenerate.append(target)
             intervals[target] = (np.minimum(lower_raw, upper_raw), np.maximum(lower_raw, upper_raw))
+
+        if degenerate:
+            # Los tres blueprints se ajustan sobre la misma `y`: el cuantil tiene
+            # que venir dentro del estimador (QuantileRegressor(quantile=...),
+            # GradientBoostingRegressor(loss="quantile", alpha=...)). Con tres
+            # estimadores de media identicos el intervalo sale de ancho cero y,
+            # sin este aviso, parece una banda del 90% perfectamente valida.
+            warnings.warn(
+                "The lower and upper estimators produce identical predictions for "
+                f"{degenerate}, so the interval has zero width. Pass genuine quantile "
+                "estimators as lower_estimator_blueprint / upper_estimator_blueprint "
+                f"(for coverage {self.interval_coverage:.2f}: quantiles "
+                f"{self.lower_quantile:.3f} and {self.upper_quantile:.3f}).",
+                UserWarning,
+                stacklevel=2,
+            )
         return intervals
 
 

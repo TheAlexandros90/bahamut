@@ -136,3 +136,58 @@ def test_notebook_helpers_come_from_the_shared_module():
 
     assert "from ._notebook import" in contenido
     assert "import ipywidgets as widgets" not in contenido
+
+
+# --------------------------------------------------------------------------
+# Intervalos de cuantiles degenerados
+# --------------------------------------------------------------------------
+
+def test_quantile_adapter_avisa_si_los_estimadores_no_son_de_cuantiles():
+    from eden import QuantileEnsembleAdapter
+
+    frame = build_series(30)
+    splits = EdenSplits(
+        train_idx=list(range(0, 20)),
+        valid_idx=list(range(20, 25)),
+        test_idx=list(range(25, 30)),
+    )
+    adapter = QuantileEnsembleAdapter(
+        center_estimator_blueprint=LinearRegression(),
+        lower_estimator_blueprint=LinearRegression(),
+        upper_estimator_blueprint=LinearRegression(),
+        lower_quantile=0.05,
+        upper_quantile=0.95,
+    )
+    model = Eden(spec=build_spec(), adapter=adapter).fit(frame, splits)
+
+    with pytest.warns(UserWarning, match="zero width"):
+        salida = model.predict_interval(frame.loc[25:29])
+
+    assert (salida["y_upper_90"] - salida["y_lower_90"]).abs().max() == pytest.approx(0.0)
+
+
+def test_quantile_adapter_no_avisa_con_estimadores_de_cuantiles_reales():
+    from sklearn.linear_model import QuantileRegressor
+
+    from eden import QuantileEnsembleAdapter
+
+    frame = build_series(40)
+    splits = EdenSplits(
+        train_idx=list(range(0, 28)),
+        valid_idx=list(range(28, 34)),
+        test_idx=list(range(34, 40)),
+    )
+    adapter = QuantileEnsembleAdapter(
+        center_estimator_blueprint=LinearRegression(),
+        lower_estimator_blueprint=QuantileRegressor(quantile=0.05, alpha=0.0),
+        upper_estimator_blueprint=QuantileRegressor(quantile=0.95, alpha=0.0),
+        lower_quantile=0.05,
+        upper_quantile=0.95,
+    )
+    model = Eden(spec=build_spec(), adapter=adapter).fit(frame, splits)
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", UserWarning)
+        salida = model.predict_interval(frame.loc[34:39])
+
+    assert (salida["y_upper_90"] - salida["y_lower_90"]).min() > 0
