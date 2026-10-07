@@ -502,6 +502,7 @@ class BahamutSplit(Bahamut):
             segmentos = self._segmentar_aleatorio(X, y, stratify_data, config)
 
         segmentos["resumen_segmentos"] = self.resumen_segmentos(segmentos)
+        segmentos["split_config"] = self.resumen_configuracion()
         return segmentos
 
     def resumen_configuracion(self) -> Dict[str, Any]:
