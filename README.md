@@ -113,6 +113,30 @@ print(segmentos["resumen_segmentos"])
 
 ## API principal
 
+### Segmentacion temporal
+
+Para `series_temporales`, indica la columna que define el orden cronologico:
+
+```python
+splitter = (
+    BahamutSplit(df)
+    .definir_problema("series_temporales")
+    .definir_objetivo("ventas")
+    .definir_orden_temporal("fecha")
+    .configurar_split(test_size=0.2, validation_size=0.2, shuffle=False)
+)
+segmentos = splitter.ejecutar_segmentacion()
+```
+
+Si el DataFrame ya esta ordenado, puedes usar
+`definir_orden_temporal(None, asumir_orden_actual=True)`. Sin una columna temporal
+ni esa indicacion explicita, se genera un error para evitar cortes sobre filas
+desordenadas. Los notebooks antiguos que omitian el orden deben actualizar esa
+llamada. Con `modo="auto"`, la estratificacion se desactiva si `shuffle=False`
+o si se separan grupos; una peticion explicita incompatible genera un error.
+
+### Consultas
+
 - `BahamutSplit`: clase principal en estilo PEP 8.
 - `Bahamut_split`: alias compatible con el notebook original.
 - `variables_disponibles_para_split()`: inventario de columnas candidatas y configuracion activa.

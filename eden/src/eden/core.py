@@ -8,6 +8,7 @@ import os
 import subprocess
 import sys
 from typing import Any, Literal, Mapping, Sequence
+import warnings
 
 import numpy as np
 import pandas as pd
@@ -595,10 +596,29 @@ class QuantileEnsembleAdapter(ForecastAdapter):
             )
 
         intervals: dict[str, tuple[np.ndarray, np.ndarray]] = {}
+        degenerate: list[str] = []
         for target in target_names:
             lower_raw = np.asarray(self.models_[target]["lower"].predict(x), dtype=float)
             upper_raw = np.asarray(self.models_[target]["upper"].predict(x), dtype=float)
+            if lower_raw.size and np.allclose(lower_raw, upper_raw):
+                degenerate.append(target)
             intervals[target] = (np.minimum(lower_raw, upper_raw), np.maximum(lower_raw, upper_raw))
+
+        if degenerate:
+            # Los tres blueprints se ajustan sobre la misma `y`: el cuantil tiene
+            # que venir dentro del estimador (QuantileRegressor(quantile=...),
+            # GradientBoostingRegressor(loss="quantile", alpha=...)). Con tres
+            # estimadores de media identicos el intervalo sale de ancho cero y,
+            # sin este aviso, parece una banda del 90% perfectamente valida.
+            warnings.warn(
+                "The lower and upper estimators produce identical predictions for "
+                f"{degenerate}, so the interval has zero width. Pass genuine quantile "
+                "estimators as lower_estimator_blueprint / upper_estimator_blueprint "
+                f"(for coverage {self.interval_coverage:.2f}: quantiles "
+                f"{self.lower_quantile:.3f} and {self.upper_quantile:.3f}).",
+                UserWarning,
+                stacklevel=2,
+            )
         return intervals
 
 
@@ -849,6 +869,7 @@ class Eden:
         self.is_fitted_ = False
 
         self.interval_calibration_source_: str | None = None
+        self.interval_calibration_is_in_sample_: bool = False
         self.train_max_timestamp_: pd.Timestamp | None = None
         self.train_max_timestamp_by_entity_: pd.Series | None = None
         self.trained_entities_: set[Any] = set()
@@ -900,6 +921,17 @@ class Eden:
             calibration_y = calibration_df[self.spec.target_cols]
             self.adapter_.calibrate(calibration_x, calibration_y, self.spec.target_cols)
             self.interval_calibration_source_ = calibration_name
+            self.interval_calibration_is_in_sample_ = calibration_name == "train"
+            if self.interval_calibration_is_in_sample_:
+                warnings.warn(
+                    "Prediction intervals were calibrated on the training split because no "
+                    f"'{self.spec.calibration_split}' partition was available. Split-conformal "
+                    "calibration assumes held-out residuals, so these intervals will be too "
+                    "narrow and will under-cover. Provide a validation split, or set "
+                    "spec.interval_coverage=None to drop the intervals.",
+                    UserWarning,
+                    stacklevel=2,
+                )
 
         self._store_training_context(train_df)
         self.is_fitted_ = True
@@ -1072,15 +1104,31 @@ class Eden:
             else:
                 train_timestamps = unique_timestamps[anchor - initial_train_periods : anchor]
 
-            fold_train_df = base_df[base_df[self.spec.timestamp_col].isin(train_timestamps)].copy()
+            # El bloque de entrenamiento del fold se parte en fit + calibracion
+            # cuando el spec pide intervalos: calibrar conformal sobre residuos
+            # de entrenamiento produce bandas sistematicamente estrechas.
+            fit_timestamps, calibration_timestamps = self._split_fold_calibration(train_timestamps)
+
+            fold_train_df = base_df[base_df[self.spec.timestamp_col].isin(fit_timestamps)].copy()
             fold_eval_df = base_df[base_df[self.spec.timestamp_col].isin(eval_timestamps)].copy()
+            fold_calibration_df = (
+                base_df[base_df[self.spec.timestamp_col].isin(calibration_timestamps)].copy()
+                if calibration_timestamps is not None
+                else None
+            )
 
             if fold_train_df.empty or fold_eval_df.empty:
                 continue
 
             fold_counter += 1
             fold_model = self._spawn_unfitted()
-            fold_model.fit(base_df, EdenSplits(train_idx=fold_train_df.index.tolist()))
+            fold_model.fit(
+                base_df,
+                EdenSplits(
+                    train_idx=fold_train_df.index.tolist(),
+                    valid_idx=None if fold_calibration_df is None or fold_calibration_df.empty else fold_calibration_df.index.tolist(),
+                ),
+            )
             fold_bundle = fold_model.predict_with_metrics(fold_eval_df)
 
             fold_prediction_df = fold_bundle["predictions"].copy()
@@ -1155,6 +1203,7 @@ class Eden:
             "adapter_class": type(self._require_adapter()).__name__,
             "supports_interval": self._supports_interval(),
             "interval_calibration_source": self.interval_calibration_source_,
+            "interval_calibration_is_in_sample": self.interval_calibration_is_in_sample_,
             "trained_targets": list(self.spec.target_cols),
             "feature_schema": dict(self.feature_schema_),
             "known_future_feature_cols": list(self.spec.known_future_feature_cols),
@@ -1597,6 +1646,25 @@ class Eden:
             raise ValueError(f"Bahamut bundle is missing required target columns: {missing_targets}")
 
         return bundle
+
+    def _split_fold_calibration(self, train_timestamps: pd.Index) -> tuple[pd.Index, pd.Index | None]:
+        """Reserva la cola del bloque de entrenamiento para calibrar intervalos.
+
+        Devuelve `(fit_timestamps, calibration_timestamps)`. Si el spec no pide
+        intervalos, o el bloque es demasiado corto para partirlo, la calibracion
+        es `None` y se entrena con todo el bloque.
+        """
+
+        if self.spec.interval_coverage is None:
+            return train_timestamps, None
+
+        total = len(train_timestamps)
+        calibration_periods = max(1, int(round(total * 0.2)))
+        if total - calibration_periods < 2:
+            return train_timestamps, None
+
+        cut = total - calibration_periods
+        return train_timestamps[:cut], train_timestamps[cut:]
 
     def _spawn_unfitted(self) -> "Eden":
         return Eden(

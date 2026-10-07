@@ -7,16 +7,9 @@ import pandas as pd
 from pandas.api.types import is_numeric_dtype
 from sklearn.model_selection import GroupShuffleSplit, train_test_split
 
-try:
-    import ipywidgets as widgets
-    from IPython import get_ipython
-    from IPython.display import clear_output, display
-except Exception:
-    widgets = None
-    clear_output = None
-    display = None
-    get_ipython = None
-
+# La capa interactiva vive en bahamut/interactive.py y se engancha a
+# BahamutSplit desde bahamut/__init__.py. Este modulo es solo el nucleo
+# analitico: no importa ipywidgets ni IPython.
 
 ProblemaML = Literal[
     "regresion",
@@ -49,32 +42,6 @@ class BahamutSplitConfig:
     group_cols: Tuple[str, ...]
     use_group_split: bool
     split_method: str
-
-
-def _bahamut_require_widgets() -> None:
-    if widgets is None or clear_output is None or display is None:
-        raise ImportError("ipywidgets e IPython son necesarios para usar la tabla interactiva de Bahamut.")
-
-
-def _bahamut_publish_notebook_bindings(**values: Any) -> None:
-    if get_ipython is None:
-        return
-
-    shell = get_ipython()
-    if shell is None or not hasattr(shell, "user_ns"):
-        return
-
-    shell.user_ns.update(values)
-
-
-def _bahamut_round_frame(frame: pd.DataFrame, round_digits: Optional[int]) -> pd.DataFrame:
-    if round_digits is None:
-        return frame
-
-    rounded = frame.copy()
-    numeric_columns = rounded.select_dtypes(include="number").columns
-    rounded.loc[:, numeric_columns] = rounded.loc[:, numeric_columns].round(int(round_digits))
-    return rounded
 
 
 class Bahamut:
@@ -162,6 +129,9 @@ class BahamutSplit(Bahamut):
     """
 
     MODOS_ESTRATIFICACION_VALIDOS = {"auto", "target", "columnas", "ninguna"}
+    # Modos en los que el usuario pide estratificar de forma explicita. "auto"
+    # queda fuera a proposito: es una preferencia, no un requisito.
+    MODOS_ESTRATIFICACION_EXPLICITOS = {"target", "columnas"}
 
     def __init__(self, df: pd.DataFrame):
         super().__init__(df)
@@ -180,6 +150,7 @@ class BahamutSplit(Bahamut):
         self.random_state: Optional[int] = 42
         self.time_col: Optional[str] = None
         self.time_ascending: bool = True
+        self.asumir_orden_actual: bool = False
 
     def definir_problema(self, problema: str) -> "BahamutSplit":
         problema_norm = str(problema).strip().lower()
@@ -228,9 +199,20 @@ class BahamutSplit(Bahamut):
         self,
         time_col: Optional[str],
         ascending: bool = True,
+        *,
+        asumir_orden_actual: bool = False,
     ) -> "BahamutSplit":
+        """Define como se ordena el DataFrame antes de una segmentacion temporal.
+
+        Para `problema="series_temporales"` hay que indicar `time_col`. Sin ella,
+        el corte se haria sobre el orden actual de las filas, que puede no ser
+        cronologico: eso mete el futuro en train y el pasado en test sin avisar.
+        Si de verdad sabes que el DataFrame ya viene ordenado, pide ese
+        comportamiento de forma explicita con `asumir_orden_actual=True`.
+        """
         self.time_col = self._normalizar_columna_unica(time_col, nombre_argumento="time_col")
         self.time_ascending = bool(ascending)
+        self.asumir_orden_actual = bool(asumir_orden_actual)
         return self
 
     def definir_estratificacion(
@@ -240,6 +222,8 @@ class BahamutSplit(Bahamut):
         modo: str = "auto",
         bins_regresion: Optional[int] = 5,
     ) -> "BahamutSplit":
+        # Toda la validacion ocurre antes de tocar el estado del objeto: si algo
+        # falla, la instancia queda exactamente como estaba.
         modo_norm = str(modo).strip().lower()
         if modo_norm not in self.MODOS_ESTRATIFICACION_VALIDOS:
             raise ValueError(
@@ -247,22 +231,23 @@ class BahamutSplit(Bahamut):
                 f"{sorted(self.MODOS_ESTRATIFICACION_VALIDOS)}"
             )
 
-        self.stratify_mode = modo_norm
-        self.regression_bins = None if bins_regresion is None else int(bins_regresion)
-        if self.regression_bins is not None and self.regression_bins < 2:
-            raise ValueError("bins_regresion debe ser al menos 2")
-
-        if modo_norm == "columnas":
-            self.stratify_cols = self._normalizar_columnas(
-                stratify_cols,
-                nombre_argumento="stratify_cols",
-            )
-        else:
-            self.stratify_cols = []
-
         if modo_norm != "columnas" and stratify_cols is not None:
             raise ValueError("Solo puedes pasar stratify_cols cuando modo='columnas'.")
 
+        bins = None if bins_regresion is None else int(bins_regresion)
+        if bins is not None and bins < 2:
+            raise ValueError("bins_regresion debe ser al menos 2")
+
+        columnas_validadas: List[str] = []
+        if modo_norm == "columnas":
+            columnas_validadas = self._normalizar_columnas(
+                stratify_cols,
+                nombre_argumento="stratify_cols",
+            )
+
+        self.stratify_mode = modo_norm
+        self.regression_bins = bins
+        self.stratify_cols = columnas_validadas
         return self
 
     def definir_grupos(self, group_cols: Optional[ColumnasInput]) -> "BahamutSplit":
@@ -320,12 +305,15 @@ class BahamutSplit(Bahamut):
                 "Bahamut no combina group split y series_temporales. Usa time_col para una segmentacion temporal explicita."
             )
 
-        if self.group_cols and self.stratify_mode != "ninguna":
+        # `auto` significa "decide tu": no puede provocar un error de
+        # configuracion. Solo se rechazan las peticiones explicitas de
+        # estratificar que son incompatibles con el resto de la configuracion.
+        if self.group_cols and self.stratify_mode in self.MODOS_ESTRATIFICACION_EXPLICITOS:
             raise ValueError(
                 "Bahamut no combina group split y estratificacion en esta version. Usa uno u otro."
             )
 
-        if not shuffle and self.stratify_mode != "ninguna":
+        if not shuffle and self.stratify_mode in self.MODOS_ESTRATIFICACION_EXPLICITOS:
             raise ValueError(
                 "No se puede estratificar si shuffle=False en train_test_split. "
                 "Usa modo='ninguna' o activa shuffle."
@@ -412,6 +400,12 @@ class BahamutSplit(Bahamut):
             parametros["time_col"] = config.time_col
             parametros["time_ascending"] = config.time_ascending
             parametros["nota_temporal"] = "Ordena el DataFrame por time_col antes de segmentar."
+        elif config.problema == "series_temporales":
+            parametros["time_col"] = None
+            parametros["nota_temporal"] = (
+                "Sin time_col: el corte usa el orden actual de las filas. "
+                "Reproducirlo exige entregar el DataFrame en ese mismo orden."
+            )
 
         if stratify_meta is not None:
             parametros["stratify"] = stratify_meta["descripcion"]
@@ -454,10 +448,14 @@ class BahamutSplit(Bahamut):
             "metodo_split": config.split_method,
             "estratificacion_activada": stratify_data is not None,
             "modo_estratificacion": config.stratify_mode,
+            "modo_estratificacion_efectivo": (
+                "aplicada" if stratify_data is not None else self._motivo_sin_estratificacion(config)
+            ),
             "regression_bins": config.regression_bins,
             "group_split_activado": group_data is not None,
             "group_cols": list(config.group_cols),
             "time_col": config.time_col,
+            "orden_temporal": self._descripcion_orden_temporal(config),
         }
 
         if stratify_meta is not None:
@@ -504,6 +502,7 @@ class BahamutSplit(Bahamut):
             segmentos = self._segmentar_aleatorio(X, y, stratify_data, config)
 
         segmentos["resumen_segmentos"] = self.resumen_segmentos(segmentos)
+        segmentos["split_config"] = self.resumen_configuracion()
         return segmentos
 
     def resumen_configuracion(self) -> Dict[str, Any]:
@@ -631,336 +630,6 @@ class BahamutSplit(Bahamut):
             return preview
         return pd.concat([preview, y_part.head(int(rows))], axis=1)
 
-    def tabla_interactiva(self, preview_rows: int = 6):
-        """Tabla interactiva para definir y ejecutar la segmentacion."""
-        _bahamut_require_widgets()
-
-        columnas = self.columnas_disponibles()
-        state: Dict[str, Any] = {"model": self, "segmentos": None}
-
-        problem_widget = widgets.Dropdown(
-            options=[(value.capitalize(), value) for value in sorted(self.PROBLEMAS_VALIDOS)],
-            value=self.problema or "clasificacion",
-            description="Problema",
-            layout=widgets.Layout(width="280px"),
-        )
-        target_widget = widgets.SelectMultiple(
-            options=columnas,
-            value=tuple(self.target_cols),
-            description="Target",
-            rows=min(8, max(4, len(columnas))),
-            layout=widgets.Layout(width="260px", height="190px"),
-        )
-        use_features_widget = widgets.Checkbox(value=bool(self.feature_cols), description="Usar features")
-        features_widget = widgets.SelectMultiple(
-            options=columnas,
-            value=tuple(self.feature_cols),
-            description="Features",
-            rows=min(8, max(4, len(columnas))),
-            layout=widgets.Layout(width="260px", height="190px"),
-        )
-        exclude_widget = widgets.SelectMultiple(
-            options=columnas,
-            value=tuple(self.exclude_cols),
-            description="Excluir",
-            rows=min(8, max(4, len(columnas))),
-            layout=widgets.Layout(width="260px", height="190px"),
-        )
-        stratify_mode_widget = widgets.Dropdown(
-            options=[
-                ("Auto", "auto"),
-                ("Target", "target"),
-                ("Columnas", "columnas"),
-                ("Ninguna", "ninguna"),
-            ],
-            value=self.stratify_mode,
-            description="Estrat.",
-            layout=widgets.Layout(width="260px"),
-        )
-        stratify_cols_widget = widgets.SelectMultiple(
-            options=columnas,
-            value=tuple(self.stratify_cols),
-            description="Strat cols",
-            rows=min(6, max(4, len(columnas))),
-            layout=widgets.Layout(width="260px", height="160px"),
-        )
-        group_cols_widget = widgets.SelectMultiple(
-            options=columnas,
-            value=tuple(self.group_cols),
-            description="Grupos",
-            rows=min(6, max(4, len(columnas))),
-            layout=widgets.Layout(width="260px", height="160px"),
-        )
-        test_size_widget = widgets.FloatSlider(
-            value=float(self.test_size),
-            min=0.05,
-            max=0.45,
-            step=0.05,
-            readout_format=".2f",
-            description="Test",
-            continuous_update=False,
-            layout=widgets.Layout(width="280px"),
-        )
-        use_validation_widget = widgets.Checkbox(
-            value=self.validation_size is not None,
-            description="Con valid",
-        )
-        validation_size_widget = widgets.FloatSlider(
-            value=0.2 if self.validation_size is None else float(self.validation_size),
-            min=0.05,
-            max=0.45,
-            step=0.05,
-            readout_format=".2f",
-            description="Valid",
-            continuous_update=False,
-            layout=widgets.Layout(width="280px"),
-        )
-        shuffle_widget = widgets.Checkbox(value=bool(self.shuffle), description="Shuffle")
-        random_state_widget = widgets.IntText(
-            value=42 if self.random_state is None else int(self.random_state),
-            description="Seed",
-            layout=widgets.Layout(width="200px"),
-        )
-        regression_bins_widget = widgets.IntSlider(
-            value=5 if self.regression_bins is None else int(self.regression_bins),
-            min=2,
-            max=10,
-            step=1,
-            description="Bins reg",
-            continuous_update=False,
-            layout=widgets.Layout(width="280px"),
-        )
-        time_col_widget = widgets.Dropdown(
-            options=[("Sin col temporal", "__none__")] + [(col, col) for col in columnas],
-            value="__none__" if self.time_col is None else self.time_col,
-            description="Time col",
-            layout=widgets.Layout(width="280px"),
-        )
-        time_order_widget = widgets.Checkbox(value=self.time_ascending, description="Asc temporal")
-        view_widget = widgets.Dropdown(
-            options=[
-                ("Resumen segmentos", "summary"),
-                ("Balance target", "balance"),
-                ("Preview segmento", "preview"),
-                ("Parametros manuales", "manual"),
-                ("Variables split", "variables"),
-            ],
-            value="summary",
-            description="Vista",
-            layout=widgets.Layout(width="280px"),
-        )
-        preview_segment_widget = widgets.Dropdown(
-            options=[("Train", "train"), ("Test", "test")],
-            value="train",
-            description="Preview",
-            layout=widgets.Layout(width="260px"),
-        )
-        preview_rows_widget = widgets.IntSlider(
-            value=max(3, int(preview_rows)),
-            min=3,
-            max=20,
-            step=1,
-            description="Filas",
-            continuous_update=False,
-            layout=widgets.Layout(width="280px"),
-        )
-        round_widget = widgets.Dropdown(
-            options=[("Sin redondeo", None)] + [(str(value), value) for value in range(0, 7)],
-            value=4,
-            description="Round",
-            layout=widgets.Layout(width="220px"),
-        )
-        refresh_button = widgets.Button(
-            description="Actualizar split",
-            button_style="primary",
-            icon="refresh",
-        )
-
-        status_output = widgets.Output()
-        summary_output = widgets.Output()
-        table_output = widgets.Output()
-
-        def _sync_options(*_):
-            selected_targets = set(target_widget.value)
-            feature_options = [col for col in columnas if col not in selected_targets]
-            current_features = tuple(col for col in features_widget.value if col in feature_options)
-            current_excludes = tuple(col for col in exclude_widget.value if col in feature_options)
-            current_stratify = tuple(col for col in stratify_cols_widget.value if col in feature_options)
-            current_groups = tuple(col for col in group_cols_widget.value if col in columnas)
-
-            features_widget.options = feature_options
-            exclude_widget.options = feature_options
-            stratify_cols_widget.options = feature_options
-            group_cols_widget.options = columnas
-            features_widget.value = current_features
-            exclude_widget.value = current_excludes
-            stratify_cols_widget.value = current_stratify
-            group_cols_widget.value = current_groups
-
-            validation_size_widget.disabled = not use_validation_widget.value
-            regression_bins_widget.disabled = problem_widget.value != "regresion"
-            time_order_widget.disabled = time_col_widget.value == "__none__"
-
-            preview_options = [("Train", "train"), ("Test", "test")]
-            if use_validation_widget.value:
-                preview_options.insert(1, ("Validation", "validation"))
-            preview_segment_widget.options = preview_options
-            if preview_segment_widget.value not in dict(preview_options).values():
-                preview_segment_widget.value = preview_options[0][1]
-
-            if problem_widget.value == "series_temporales":
-                shuffle_widget.value = False
-                shuffle_widget.disabled = True
-                if stratify_mode_widget.value != "ninguna":
-                    stratify_mode_widget.value = "ninguna"
-                if group_cols_widget.value:
-                    group_cols_widget.value = ()
-                group_cols_widget.disabled = True
-            else:
-                shuffle_widget.disabled = False
-                group_cols_widget.disabled = False
-
-            group_split_active = bool(group_cols_widget.value)
-            if group_split_active and stratify_mode_widget.value != "ninguna":
-                stratify_mode_widget.value = "ninguna"
-
-            stratify_mode_widget.disabled = problem_widget.value == "series_temporales" or group_split_active
-            stratify_cols_widget.disabled = stratify_mode_widget.value != "columnas" or group_split_active
-
-        def _build_model() -> "BahamutSplit":
-            selected_targets = list(target_widget.value)
-            selected_features = list(features_widget.value) if use_features_widget.value else None
-            selected_excludes = list(exclude_widget.value)
-            selected_groups = list(group_cols_widget.value)
-            validation_size = float(validation_size_widget.value) if use_validation_widget.value else None
-            time_col = None if time_col_widget.value == "__none__" else time_col_widget.value
-            stratify_cols = list(stratify_cols_widget.value) if stratify_mode_widget.value == "columnas" else None
-            random_state = int(random_state_widget.value) if shuffle_widget.value else None
-
-            model = (
-                BahamutSplit(self.df.copy())
-                .definir_problema(problem_widget.value)
-                .definir_objetivo(selected_targets or None)
-                .definir_predictoras(selected_features, selected_excludes)
-                .definir_grupos(selected_groups or None)
-                .definir_orden_temporal(time_col, ascending=time_order_widget.value)
-                .definir_estratificacion(
-                    stratify_cols,
-                    modo=stratify_mode_widget.value,
-                    bins_regresion=int(regression_bins_widget.value),
-                )
-                .configurar_split(
-                    test_size=float(test_size_widget.value),
-                    validation_size=validation_size,
-                    shuffle=bool(shuffle_widget.value),
-                    random_state=random_state,
-                )
-            )
-            return model
-
-        def _render(_=None):
-            with status_output:
-                clear_output(wait=True)
-                print("Actualizando tabla de split...")
-
-            try:
-                model = _build_model()
-                segmentos = model.ejecutar_segmentacion()
-                state["model"] = model
-                state["segmentos"] = segmentos
-
-                config_frame = pd.Series(model.resumen_configuracion(), name="valor").to_frame()
-                diagnostic_frame = pd.Series(model.diagnostico_split(), name="valor").to_frame()
-                config_frame = _bahamut_round_frame(config_frame, round_widget.value)
-                diagnostic_frame = _bahamut_round_frame(diagnostic_frame, round_widget.value)
-
-                if view_widget.value == "summary":
-                    frame = model.resumen_segmentos(segmentos)
-                elif view_widget.value == "manual":
-                    frame = pd.Series(model.parametros_para_split_manual(), name="valor").to_frame()
-                elif view_widget.value == "balance":
-                    try:
-                        frame = model.balance_target_por_segmento(segmentos)
-                    except Exception as exc:
-                        frame = pd.DataFrame({"info": [str(exc)]})
-                elif view_widget.value == "variables":
-                    frame = model.tabla_variables_split()
-                else:
-                    frame = model.preview_segmento(
-                        segmentos,
-                        segmento=preview_segment_widget.value,
-                        rows=int(preview_rows_widget.value),
-                    )
-
-                frame = _bahamut_round_frame(frame, round_widget.value)
-
-                with summary_output:
-                    clear_output(wait=True)
-                    print("Configuracion activa")
-                    display(config_frame)
-                    print("Diagnostico")
-                    display(diagnostic_frame)
-
-                with table_output:
-                    clear_output(wait=True)
-                    display(frame)
-
-                _bahamut_publish_notebook_bindings(
-                    bahamut_split=model,
-                    bahamut_segmentos=segmentos,
-                    bahamut_split_view=frame,
-                )
-
-                with status_output:
-                    clear_output(wait=True)
-                    print("Tabla de split lista")
-            except Exception as exc:
-                with summary_output:
-                    clear_output(wait=True)
-                with table_output:
-                    clear_output(wait=True)
-                with status_output:
-                    clear_output(wait=True)
-                    print(f"No se pudo construir la tabla de split: {exc}")
-
-        target_widget.observe(_sync_options, names="value")
-        use_validation_widget.observe(_sync_options, names="value")
-        stratify_mode_widget.observe(_sync_options, names="value")
-        problem_widget.observe(_sync_options, names="value")
-        time_col_widget.observe(_sync_options, names="value")
-        group_cols_widget.observe(_sync_options, names="value")
-        refresh_button.on_click(_render)
-
-        _sync_options()
-        _render()
-
-        controls = widgets.VBox(
-            [
-                widgets.HTML("<b>Tabla interactiva de BahamutSplit</b>"),
-                widgets.HTML(
-                    "<i>Configura train/test o train/validation/test, define variables, grupos, estratificacion y revisa el diagnostico antes de ejecutar.</i>"
-                ),
-                problem_widget,
-                target_widget,
-                use_features_widget,
-                widgets.HBox([features_widget, exclude_widget]),
-                stratify_mode_widget,
-                widgets.HBox([stratify_cols_widget, group_cols_widget]),
-                widgets.HBox([test_size_widget, validation_size_widget]),
-                widgets.HBox([use_validation_widget, shuffle_widget]),
-                widgets.HBox([random_state_widget, regression_bins_widget]),
-                widgets.HBox([time_col_widget, time_order_widget]),
-                view_widget,
-                widgets.HBox([preview_segment_widget, preview_rows_widget]),
-                round_widget,
-                refresh_button,
-                status_output,
-            ]
-        )
-        content = widgets.VBox([summary_output, table_output], layout=widgets.Layout(width="100%"))
-        return widgets.HBox([controls, content], layout=widgets.Layout(align_items="flex-start"))
-
-    interactive_table = tabla_interactiva
 
     def _construir_config_split(self) -> BahamutSplitConfig:
         feature_cols = tuple(self._resolver_feature_cols())
@@ -990,6 +659,25 @@ class BahamutSplit(Bahamut):
             use_group_split=bool(self.group_cols),
             split_method=self._resolver_metodo_split(),
         )
+
+    def _motivo_sin_estratificacion(self, config: BahamutSplitConfig) -> str:
+        if config.stratify_mode == "ninguna":
+            return "desactivada por configuracion"
+        if config.use_group_split:
+            return "desactivada: incompatible con group split"
+        if not config.shuffle:
+            return "desactivada: shuffle=False"
+        if config.stratify_mode == "auto":
+            return "auto no encontro una estratificacion aplicable"
+        return "no aplicada"
+
+    def _descripcion_orden_temporal(self, config: BahamutSplitConfig) -> str:
+        if config.problema != "series_temporales":
+            return "no aplica"
+        if config.time_col is not None:
+            sentido = "ascendente" if config.time_ascending else "descendente"
+            return f"ordenado por '{config.time_col}' ({sentido})"
+        return "orden actual de las filas del DataFrame (asumido de forma explicita)"
 
     def _resolver_metodo_split(self) -> str:
         if self.problema == "series_temporales":
@@ -1538,16 +1226,24 @@ class BahamutSplit(Bahamut):
                 "La segmentacion temporal no se combina con group split. Usa time_col o cambia el tipo de problema."
             )
 
+        if self.problema == "series_temporales" and self.time_col is None and not self.asumir_orden_actual:
+            raise ValueError(
+                "Una segmentacion temporal necesita saber el orden cronologico. "
+                "Llama a definir_orden_temporal('mi_columna_de_fecha') o, si el DataFrame "
+                "ya viene ordenado y quieres cortar por el orden de filas, pidelo de forma "
+                "explicita con definir_orden_temporal(None, asumir_orden_actual=True)."
+            )
+
         if self.stratify_mode == "columnas" and not self.stratify_cols:
             raise ValueError("Si usas modo='columnas', debes indicar stratify_cols validas.")
 
         if self.stratify_mode == "target" and not self.target_cols:
             raise ValueError("Si usas modo='target', primero debes definir target_cols.")
 
-        if self.stratify_mode != "ninguna" and not self.shuffle:
+        if self.stratify_mode in self.MODOS_ESTRATIFICACION_EXPLICITOS and not self.shuffle:
             raise ValueError("No se puede estratificar con shuffle=False en train_test_split.")
 
-        if self.group_cols and self.stratify_mode != "ninguna":
+        if self.group_cols and self.stratify_mode in self.MODOS_ESTRATIFICACION_EXPLICITOS:
             raise ValueError(
                 "Bahamut no combina group split y estratificacion en esta version. Usa uno u otro."
             )
